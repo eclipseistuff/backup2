@@ -3069,6 +3069,7 @@ window.addEventListener('resize', () => {
       config.wispUrls = [activeWisp];
     } catch (_) {}
   }
+  window.brApplyEclipseWisp = brApplyEclipseWisp;
 
   function brLoadProxy(url) {
     const frame = document.getElementById("proxy-frame");
@@ -6777,11 +6778,11 @@ document.addEventListener('DOMContentLoaded', function() {
   const originalProxy = window.openProxy;
   const originalMusic = window.openMusicPanel;
   window.openProxy = window.openBrowserPanel = function (url) {
-    brApplyEclipseWisp();
+    if (typeof window.brApplyEclipseWisp === "function") window.brApplyEclipseWisp();
     originalProxy?.(url);
   };
   window.openMusicPanel = function (event) {
-    brApplyEclipseWisp();
+    if (typeof window.brApplyEclipseWisp === "function") window.brApplyEclipseWisp();
     originalMusic?.(event);
   };
 })();

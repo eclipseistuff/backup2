@@ -3642,6 +3642,122 @@ function handleServiceWorkerMessage(event) {
 	recoverTransport(reason, { reloadActive, silent: !reloadActive });
 }
 
+// ── Eclipse relay bridge ─────────────────────────────────────────────
+// Lets the embedding Eclipse shell route small API calls (AI chat, music
+// search) through Pulsar's already-working Wisp transport. The shell page
+// posts { type: "eclipse-relay-request", id, url, method, headers, body }
+// and gets back { type: "eclipse-relay-response", id, status, headers,
+// body } where body is an ArrayBuffer (transferred). Same-origin only,
+// http(s) targets only, small text bodies only.
+const ECLIPSE_RELAY_METHODS = new Set(["GET", "HEAD", "POST"]);
+const ECLIPSE_RELAY_MAX_BODY = 256 * 1024;
+
+function eclipseRelayReadyPing() {
+	try {
+		if (window.parent && window.parent !== window) {
+			window.parent.postMessage(
+				{ type: "eclipse-relay-ready" },
+				window.location.origin
+			);
+		}
+	} catch (_) {}
+}
+
+async function handleEclipseRelayMessage(event) {
+	const data = event.data;
+	if (!data || data.type !== "eclipse-relay-request") return;
+	if (event.origin !== window.location.origin) return;
+	const source = event.source;
+	const id = data.id;
+	const respond = (payload, transfer) => {
+		try {
+			source.postMessage(
+				{ type: "eclipse-relay-response", id, ...payload },
+				{ targetOrigin: event.origin, transfer: transfer || [] }
+			);
+		} catch (_) {
+			try {
+				source.postMessage(
+					{ type: "eclipse-relay-response", id, ...payload },
+					event.origin
+				);
+			} catch (_) {}
+		}
+	};
+	let target;
+	try {
+		target = new URL(String(data.url || ""));
+	} catch (_) {
+		respond({ error: "invalid url" });
+		return;
+	}
+	if (target.protocol !== "http:" && target.protocol !== "https:") {
+		respond({ error: "only http(s) urls are supported" });
+		return;
+	}
+	const method = String(data.method || "GET").toUpperCase();
+	if (!ECLIPSE_RELAY_METHODS.has(method)) {
+		respond({ error: "method not allowed" });
+		return;
+	}
+	let body = null;
+	if (typeof data.body === "string" && data.body) {
+		if (data.body.length > ECLIPSE_RELAY_MAX_BODY) {
+			respond({ error: "body too large" });
+			return;
+		}
+		body = data.body;
+	}
+	const headerPairs = [];
+	if (Array.isArray(data.headers)) {
+		for (const pair of data.headers) {
+			if (Array.isArray(pair) && typeof pair[0] === "string") {
+				headerPairs.push([pair[0], String(pair[1] ?? "")]);
+			}
+		}
+	}
+	try {
+		await selectBestWispForLaunch();
+		const wispUrl = getWispUrl();
+		await withTimeout(
+			ensureTransport(wispUrl),
+			35000,
+			"Relay transport timed out"
+		);
+		const res = await withTimeout(
+			activeTransportClient.request(target, method, body, headerPairs, undefined),
+			40000,
+			"Relay request timed out"
+		);
+		const buf = await new Response(res.body).arrayBuffer();
+		const headers = {};
+		const raw = res.headers || {};
+		for (const key of Object.keys(raw)) {
+			try {
+				headers[key] = String(raw[key]);
+			} catch (_) {}
+		}
+		respond(
+			{
+				status: res.status || 0,
+				statusText: String(res.statusText || ""),
+				headers,
+				body: buf,
+			},
+			[buf]
+		);
+	} catch (err) {
+		respond({ error: String(err?.message || err || "relay failed") });
+	}
+}
+
+window.addEventListener("message", (event) => {
+	if (event.data?.type === "eclipse-relay-request")
+		handleEclipseRelayMessage(event);
+});
+if (document.readyState === "complete") eclipseRelayReadyPing();
+window.addEventListener("load", eclipseRelayReadyPing);
+
 async function launchInProxy(rawInput, tab = getActiveTab()) {
 	closeSuggestions();
 	clearError();

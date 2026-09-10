@@ -11,24 +11,76 @@ function apiCorsHeaders(methods) {
   };
 }
 
+// The nova worker (AI_API_UPSTREAM) is a GET-only URL relay: it requires a
+// `url` query param and cannot carry POST bodies, so forwarding the chat
+// payload to it always fails with 400 "url param required". Instead this
+// gateway translates the OpenAI-style POST { messages } body into a
+// keyless Pollinations GET request and wraps the plain-text answer back
+// into OpenAI shape ({ choices[0].message.content }) so the frontend
+// parser works unchanged.
+const AI_CHAT_BACKEND = "https://text.pollinations.ai";
+const AI_CHAT_MODEL = "openai";
+
+function aiTextOf(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((b) => b && (b.type === "text" || typeof b.text === "string"))
+      .map((b) => (typeof b.text === "string" ? b.text : ""))
+      .join(" ");
+  }
+  return "";
+}
+
+function aiClip(n, s) {
+  const text = String(s || "");
+  return text.length > n ? text.slice(0, n) : text;
+}
+
 async function proxyAi(request) {
   const cors = apiCorsHeaders("POST, OPTIONS");
   if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors });
   if (request.method !== "POST") return new Response("Method not allowed", { status: 405, headers: { ...cors, "content-type": "text/plain; charset=utf-8" } });
-  try {
-    const upstream = await fetch(AI_API_UPSTREAM, {
-      method: "POST",
-      headers: { "content-type": request.headers.get("content-type") || "application/json" },
-      body: await request.arrayBuffer(),
-    });
-    const headers = new Headers(cors);
-    headers.set("content-type", upstream.headers.get("content-type") || "application/json");
-    return new Response(upstream.body, { status: upstream.status, headers });
-  } catch (error) {
-    return new Response(JSON.stringify({ error: { message: "AI upstream error: " + (error?.message || error) } }), {
-      status: 502,
+  const fail = (message, status = 502) =>
+    new Response(JSON.stringify({ error: { message } }), {
+      status,
       headers: { ...cors, "content-type": "application/json; charset=utf-8" },
     });
+  let payload;
+  try {
+    payload = await request.json();
+  } catch (_) {
+    return fail("Request body must be JSON with a messages array", 400);
+  }
+  const messages = Array.isArray(payload?.messages) ? payload.messages : null;
+  if (!messages || !messages.length) return fail("Request body must be JSON with a messages array", 400);
+  const system = aiClip(
+    600,
+    messages.filter((m) => m?.role === "system").map((m) => aiTextOf(m.content)).join(" ")
+  );
+  const convo = aiClip(
+    1800,
+    messages
+      .filter((m) => m && m.role !== "system" && aiTextOf(m.content).trim())
+      .slice(-8)
+      .map((m) => (m.role === "assistant" ? "Assistant: " : "User: ") + aiTextOf(m.content).trim())
+      .join("\n")
+  );
+  if (!convo.trim()) return fail("No user message found", 400);
+  const target =
+    AI_CHAT_BACKEND + "/" + encodeURIComponent(convo) +
+    "?model=" + encodeURIComponent(AI_CHAT_MODEL) +
+    (system.trim() ? "&system=" + encodeURIComponent(system) : "");
+  try {
+    const upstream = await fetch(target, { headers: { accept: "text/plain" } });
+    const text = (await upstream.text()).trim();
+    if (!upstream.ok || !text) return fail("AI backend error (HTTP " + upstream.status + ")", 502);
+    return new Response(
+      JSON.stringify({ choices: [{ message: { role: "assistant", content: text } }] }),
+      { status: 200, headers: { ...cors, "content-type": "application/json; charset=utf-8" } }
+    );
+  } catch (error) {
+    return fail("AI upstream error: " + (error?.message || error));
   }
 }
 

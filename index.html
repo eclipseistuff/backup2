@@ -3070,6 +3070,7 @@ window.addEventListener('resize', () => {
     } catch (_) {}
   }
   window.brApplyEclipseWisp = brApplyEclipseWisp;
+  window.brWarmProxy = function() { try { brLoadProxy(null); } catch (_) {} };
 
   function brLoadProxy(url) {
     const frame = document.getElementById("proxy-frame");
@@ -3341,6 +3342,25 @@ function mpProxyUrl(url) {
   return new URL('./api/music?url=' + encodeURIComponent(url), document.baseURI).href;
 }
 
+// Search JSON through the working web proxy when filters block the music
+// hosts. Falls back to the normal (service-worker) fetch when the proxy
+// frame isn't warmed up yet — warming it in the background for next time.
+async function mpRelayOrFetch(targetUrl, opts) {
+  if (typeof window.eclipseRelayFetch === 'function' && window._eclipseRelayReady) {
+    try {
+      const r = await window.eclipseRelayFetch(targetUrl, {
+        method: 'GET',
+        headers: { accept: 'application/json' },
+        timeout: 15000
+      });
+      if (r.ok) return { ok: true, json: () => r.json() };
+    } catch (_) {}
+  } else if (typeof window.brWarmProxy === 'function') {
+    try { window.brWarmProxy(); } catch (_) {}
+  }
+  return fetch(mpProxyUrl(targetUrl), opts);
+}
+
 const MP_MONO_INSTANCES = [
   // monochrome.tf cluster
   'https://ohio.monochrome.tf',
@@ -3433,7 +3453,7 @@ function mpNormSaavn(item){
 }
 
 async function mpSearchSaavn(q){
-  const r = await fetch(mpProxyUrl(`${MP_SAAVN_API}/api/search/songs?query=${encodeURIComponent(q)}&limit=40`), {signal: AbortSignal.timeout(8000)});
+  const r = await mpRelayOrFetch(`${MP_SAAVN_API}/api/search/songs?query=${encodeURIComponent(q)}&limit=40`, {signal: AbortSignal.timeout(8000)});
   if(!r.ok) throw new Error('saavn error');
   const data = await r.json();
   const results = data?.data?.results || data?.results || [];
@@ -3445,7 +3465,7 @@ async function mpSearchSaavn(q){
 async function mpRaceInstances(pathFn, validateFn){
   if(_mpFastInstance){
     try{
-      const r=await fetch(mpProxyUrl(pathFn(_mpFastInstance)),{signal:AbortSignal.timeout(4000)});
+      const r=await mpRelayOrFetch(pathFn(_mpFastInstance),{signal:AbortSignal.timeout(4000)});
       if(r.ok){
         const data=await r.json();
         const result=validateFn(data);
@@ -3455,7 +3475,7 @@ async function mpRaceInstances(pathFn, validateFn){
   }
 
   const race = MP_MONO_INSTANCES.map(async base=>{
-    const r=await fetch(mpProxyUrl(pathFn(base)),{signal:AbortSignal.timeout(5000)});
+    const r=await mpRelayOrFetch(pathFn(base),{signal:AbortSignal.timeout(5000)});
     if(!r.ok) throw new Error('not ok');
     const data=await r.json();
     const result=validateFn(data);
@@ -3492,7 +3512,7 @@ function mpDeezerJsonp(path, timeoutMs = 8000){
 }
 
 async function mpSearchDeezer(q){
-  const r = await fetch(mpProxyUrl(`https://api.deezer.com/search?q=${encodeURIComponent(q)}&limit=40`), {signal: AbortSignal.timeout(8000)});
+  const r = await mpRelayOrFetch(`https://api.deezer.com/search?q=${encodeURIComponent(q)}&limit=40`, {signal: AbortSignal.timeout(8000)});
   if(!r.ok) throw new Error('deezer error');
   const data = await r.json();
   const items = (data.data || []).filter(x => x.preview);
@@ -4875,7 +4895,10 @@ init();
 
 <script>
 (function() {
-  const AI_API_UPSTREAM = 'https://nova.notrexed.workers.dev';
+  // Keyless chat backend. The nova worker is a GET-only URL relay (it
+  // 400s on POST with "url param required"), so chat POSTs go here
+  // instead — directly, or tunneled through the web proxy (see below).
+  const AI_DIRECT_ENDPOINT = 'https://text.pollinations.ai/openai';
   function canUseSameOriginApi() {
     try {
       const base = new URL(document.baseURI);
@@ -4889,8 +4912,8 @@ init();
   }
   const AI_PROXY_ENDPOINT = new URL('./api/ai', document.baseURI).href;
   const AI_ENDPOINTS = canUseSameOriginApi()
-    ? [AI_PROXY_ENDPOINT, AI_API_UPSTREAM]
-    : [AI_API_UPSTREAM];
+    ? [AI_PROXY_ENDPOINT, AI_DIRECT_ENDPOINT]
+    : [AI_DIRECT_ENDPOINT];
   let aiTyping = false;
 
   let chats = JSON.parse(localStorage.getItem('nova_ai_chats') || '[]');
@@ -5039,6 +5062,14 @@ init();
 
   function aiAutoResize(ta) { ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 120) + 'px'; }
 
+  function parseAiChoice(data) {
+    try {
+      const raw = data.choices?.[0]?.message?.content;
+      if (Array.isArray(raw)) return raw.filter(b => b && b.type === 'text').map(b => b.text).join('').trim();
+      return (typeof raw === 'string' ? raw : '').trim();
+    } catch (_) { return ''; }
+  }
+
   window.aiSend = async function() {
     if (aiTyping) return;
     const input = document.getElementById('ai-input');
@@ -5073,14 +5104,33 @@ init();
 
       let reply = '';
       let lastErr = '';
-      for (let attempt = 0; attempt < 4; attempt++) {
+      // 1) Unblocked path: tunnel the chat POST through the working web
+      // proxy (Pulsar wisp transport) so filters can't block the AI host.
+      if (typeof window.eclipseRelayFetch === 'function') {
+        try {
+          const relayRes = await window.eclipseRelayFetch(AI_DIRECT_ENDPOINT, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ model: 'openai', messages }),
+            timeout: 55000
+          });
+          const relayData = await relayRes.json();
+          if (!relayRes.ok) throw new Error(relayData?.error?.message || 'Relay failed (' + relayRes.status + ')');
+          reply = parseAiChoice(relayData);
+          if (!reply) lastErr = 'Empty reply from proxy relay';
+        } catch (relayErr) {
+          lastErr = (relayErr && relayErr.message) || String(relayErr);
+        }
+      }
+      // 2) Same-origin service-worker gateway, then direct backend.
+      for (let attempt = 0; !reply && attempt < 4; attempt++) {
         let res, data;
         try {
           const endpoint = AI_ENDPOINTS[attempt % AI_ENDPOINTS.length];
           res = await fetch(endpoint, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ messages })
+            body: JSON.stringify({ model: 'openai', messages })
           });
           data = await res.json();
         } catch(fetchErr) {
@@ -5091,12 +5141,7 @@ init();
           lastErr = data?.error?.message || 'Request failed (' + res.status + ')';
           continue;
         }
-        const raw = data.choices?.[0]?.message?.content;
-        if (Array.isArray(raw)) {
-          reply = raw.filter(b => b.type === 'text').map(b => b.text).join('').trim();
-        } else {
-          reply = (typeof raw === 'string' ? raw : '').trim();
-        }
+        reply = parseAiChoice(data);
         if (reply) break;
         await new Promise(r => setTimeout(r, 600 * (attempt + 1)));
       }
@@ -6784,6 +6829,104 @@ document.addEventListener('DOMContentLoaded', function() {
   window.openMusicPanel = function (event) {
     if (typeof window.brApplyEclipseWisp === "function") window.brApplyEclipseWisp();
     originalMusic?.(event);
+  };
+
+  // ── Wisp relay client ──────────────────────────────────────────────
+  // Routes small API calls through Pulsar's already-working proxy
+  // transport (postMessage to the proxy iframe), so school filters that
+  // block api domains can't kill AI chat or music search. Falls back to
+  // normal fetch when the proxy frame isn't ready.
+  let _relaySeq = 0;
+  const _relayPending = new Map();
+  window._eclipseRelayReady = false;
+  window.addEventListener("message", (event) => {
+    const d = event.data;
+    if (!d || typeof d !== "object") return;
+    try {
+      if (d.type === "eclipse-relay-ready") {
+        if (event.origin === window.location.origin) window._eclipseRelayReady = true;
+        return;
+      }
+      if (d.type !== "eclipse-relay-response" || !_relayPending.has(d.id)) return;
+      if (event.origin !== window.location.origin) return;
+      const settle = _relayPending.get(d.id);
+      _relayPending.delete(d.id);
+      settle(d);
+    } catch (_) {}
+  });
+  function eclipseRelayFrame() {
+    try {
+      const f = document.getElementById("proxy-frame");
+      return f && f.contentWindow ? f : null;
+    } catch (_) { return null; }
+  }
+  window.eclipseRelayEnsure = function (timeoutMs) {
+    timeoutMs = timeoutMs || 20000;
+    return new Promise((resolve) => {
+      if (window._eclipseRelayReady) return resolve(true);
+      try {
+        if (typeof window.brWarmProxy === "function") window.brWarmProxy();
+      } catch (_) {}
+      const start = Date.now();
+      const timer = setInterval(() => {
+        if (window._eclipseRelayReady || Date.now() - start > timeoutMs) {
+          clearInterval(timer);
+          resolve(window._eclipseRelayReady);
+        }
+      }, 250);
+    });
+  };
+  window.eclipseRelayFetch = function (targetUrl, options) {
+    options = options || {};
+    const method = (options.method || "GET").toUpperCase();
+    const timeout = options.timeout || 40000;
+    return window.eclipseRelayEnsure(20000).then((ready) => {
+      if (!ready) throw new Error("proxy relay not ready");
+      const frame = eclipseRelayFrame();
+      if (!frame) throw new Error("no proxy frame");
+      const id = "rl" + (++_relaySeq) + "_" + Date.now();
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          _relayPending.delete(id);
+          reject(new Error("relay timeout"));
+        }, timeout);
+        _relayPending.set(id, (res) => {
+          clearTimeout(timer);
+          if (res && res.error) {
+            reject(new Error(res.error));
+            return;
+          }
+          const buf = res && res.body ? res.body : null;
+          const bytes = buf ? new Uint8Array(buf) : new Uint8Array(0);
+          const decode = () => { try { return new TextDecoder().decode(bytes); } catch (_) { return ""; } };
+          resolve({
+            ok: res.status >= 200 && res.status < 300,
+            status: res.status || 0,
+            headers: (res && res.headers) || {},
+            arrayBuffer: async () => (buf ? buf.slice(0) : new ArrayBuffer(0)),
+            text: async () => decode(),
+            json: async () => JSON.parse(decode()),
+          });
+        });
+        const headerPairs = [];
+        const headers = options.headers || {};
+        for (const k of Object.keys(headers)) headerPairs.push([k, String(headers[k])]);
+        try {
+          frame.contentWindow.postMessage({
+            type: "eclipse-relay-request",
+            id,
+            url: String(targetUrl),
+            method,
+            headers: headerPairs,
+            body: typeof options.body === "string" ? options.body : null,
+          }, window.location.origin);
+        } catch (e) {
+          clearTimeout(timer);
+          _relayPending.delete(id);
+          reject(e);
+        }
+      });
+    });
   };
 })();
 </script>

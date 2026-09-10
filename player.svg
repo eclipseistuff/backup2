@@ -7,7 +7,7 @@
   </foreignObject>
   <script><![CDATA[
 (() => {
-  const SOURCE_URL = "https://cdn.jsdelivr.net/gh/shayderrr/eclipse@main/player.html";
+  const SOURCE_URL = new URL("./player.html", document.baseURI).href;
   const SW_URL = new URL("./sw.js", document.baseURI).href;
   const frame = document.getElementById("svg-html-frame");
 

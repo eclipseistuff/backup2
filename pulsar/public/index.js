@@ -2070,15 +2070,39 @@ function createFullscreenFrame() {
 }
 
 function getWispUrl() {
-	return "wss://probuildingsupplies.com/w/";
+	const fallback = getConfiguredWispUrls()[0] || "";
+	const sourceUrl = selectedWispUrl || fallback;
+	if (sourceUrl.trim() === "") {
+		throw new Error(
+			"Set window.__PULSAR_CONFIG__.wispUrl (or wispUrls) in config.js."
+		);
+	}
+
+	const url = normalizeWispUrl(sourceUrl);
+	if (!url) {
+		throw new Error("The configured Wisp URL must start with ws:// or wss://.");
+	}
+
+	return url;
 }
 
 function getConfiguredWispUrls() {
-	return ["wss://probuildingsupplies.com/w/"];
+	const urls = [];
+	if (typeof config.wispUrl === "string") urls.push(config.wispUrl);
+	if (Array.isArray(config.wispUrls)) urls.push(...config.wispUrls);
+	const deduped = new Set();
+	const valid = [];
+	for (const candidate of urls) {
+		const normalized = normalizeWispUrl(candidate);
+		if (!normalized || deduped.has(normalized)) continue;
+		deduped.add(normalized);
+		valid.push(normalized);
+	}
+	return valid;
 }
 
 function getPrimaryWispUrl() {
-	return "wss://probuildingsupplies.com/w/";
+	return normalizeWispUrl(config.wispUrl) || getConfiguredWispUrls()[0] || "";
 }
 
 function getWispPingTimeoutMs() {
@@ -2092,11 +2116,87 @@ function getWispPingConcurrency() {
 }
 
 function pingWispAttempt(url, timeoutMs = getWispPingTimeoutMs()) {
-	return Promise.resolve({ url, latency: 0, reachable: true });
+	return new Promise((resolve) => {
+		const startedAt = performance.now();
+		let ws = null;
+		let settled = false;
+		let triedLegacy = false;
+		const detach = (socket) => {
+			if (!socket) return;
+			socket.onopen = null;
+			socket.onerror = null;
+			socket.onclose = null;
+			try {
+
+				if (
+					socket.readyState === WebSocket.OPEN ||
+					socket.readyState === WebSocket.CONNECTING
+				) {
+					socket.close();
+				}
+			} catch (_) {}
+		};
+		const finish = (latency, reachable) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			detach(ws);
+			resolve({ url, latency, reachable });
+		};
+		const retryOrFail = (protocol) => {
+			if (protocol && !triedLegacy) {
+				triedLegacy = true;
+				detach(ws);
+				connect("");
+				return;
+			}
+			finish(Number.POSITIVE_INFINITY, false);
+		};
+		const connect = (protocol) => {
+			try {
+				ws = protocol ? new WebSocket(url, protocol) : new WebSocket(url);
+			} catch (_) {
+				retryOrFail(protocol);
+				return;
+			}
+			ws.onopen = () => finish(Math.round(performance.now() - startedAt), true);
+			ws.onerror = () => retryOrFail(protocol);
+
+			ws.onclose = () => retryOrFail(protocol);
+		};
+		const timer = setTimeout(
+			() => finish(Number.POSITIVE_INFINITY, false),
+			timeoutMs
+		);
+		connect("wisp-v2");
+	});
 }
 
 async function pingWisp(url) {
-	return { url, latency: 0, bestLatency: 0, reachable: true, successes: 1, attempts: 1 };
+	const attempts = [];
+	for (let attempt = 0; attempt < WISP_PING_ATTEMPTS; attempt++) {
+		attempts.push(await pingWispAttempt(url));
+	}
+	const successful = attempts.filter((attempt) => attempt.reachable);
+	const successes = successful.length;
+	const latency = successes
+		? Math.round(
+				successful.reduce((total, attempt) => total + attempt.latency, 0) /
+					successes
+			)
+		: Infinity;
+	const bestLatency = successes
+		? Math.min(...successful.map((attempt) => attempt.latency))
+		: Infinity;
+
+	return {
+		url,
+		latency,
+		bestLatency,
+		reachable: successes > 0,
+		successes,
+		attempts: WISP_PING_ATTEMPTS,
+	};
 }
 
 function getWispFailureCount(url) {
@@ -2149,7 +2249,10 @@ function compareWispServers(a, b) {
 }
 
 function getBestReachableWispUrl() {
-	return "wss://probuildingsupplies.com/w/";
+	const healthy = wispServers.find(
+		(server) => server.reachable && !getWispFailureCount(server.url)
+	);
+	return (healthy || wispServers.find((server) => server.reachable))?.url || "";
 }
 
 function formatWispHealth(server) {
@@ -2549,11 +2652,39 @@ function storeTransportId(id) {
 }
 
 function getNextWispUrl(currentUrl) {
-	return "wss://probuildingsupplies.com/w/";
+	const urls = getConfiguredWispUrls();
+	if (!urls.length) return currentUrl;
+	const currentIndex = urls.indexOf(currentUrl);
+	return urls[(currentIndex + 1 + urls.length) % urls.length] || urls[0];
 }
 
 function getNextFailoverWispUrl(currentUrl) {
-	return "wss://probuildingsupplies.com/w/";
+	const urls = getConfiguredWispUrls();
+	if (urls.length <= 1) return currentUrl;
+
+	const reachable = wispServers.filter(
+		(server) => server.reachable && server.url !== currentUrl
+	);
+	const ranked = (
+		reachable.filter((server) => !getWispFailureCount(server.url)).length
+			? reachable.filter((server) => !getWispFailureCount(server.url))
+			: reachable
+	).map((server) => server.url);
+	if (ranked.length) {
+		return ranked[wispFailoverIndex++ % ranked.length];
+	}
+
+	const unknown = urls.filter((url) => {
+		if (url === currentUrl) return false;
+		const health = wispHealthResults.find((server) => server.url === url);
+		return !health || health.pending;
+	});
+	if (unknown.length) {
+		return unknown[wispFailoverIndex++ % unknown.length];
+	}
+
+	wispFailoverIndex += 1;
+	return getNextWispUrl(currentUrl);
 }
 
 function renderTransportOptions() {
@@ -2706,13 +2837,126 @@ async function recoverTransport(reason = "", options = {}) {
 	return transportRecoveryPromise;
 }
 
-function initializeWispDropdowns() {}
+function initializeWispDropdowns() {
+	const configured = getConfiguredWispUrls();
+	if (!configured.length) return;
 
-function scheduleWispHealthChecks() {}
+	wispHealthResults = configured.map((url, index) => ({
+		url,
+		index,
+		latency: Infinity,
+		bestLatency: Infinity,
+		reachable: false,
+		successes: 0,
+		attempts: WISP_PING_ATTEMPTS,
+		pending: true,
+	}));
+	renderWispOptions(wispHealthResults);
+}
 
-async function runWispHealthChecks() {}
+function scheduleWispHealthChecks(options = {}) {
+	const { immediate = false, stopOnFirst = false } = options;
+	if (wispHealthCheckPromise) return wispHealthCheckPromise;
+	if (immediate) {
+		if (wispHealthTimer) {
+			window.clearTimeout(wispHealthTimer);
+			wispHealthTimer = null;
+		}
+		wispHealthCheckScheduled = true;
+		return runWispHealthChecks({ stopOnFirst });
+	}
+	if (wispHealthCheckScheduled || wispHealthCheckCompleted || wispHealthTimer)
+		return;
+	wispHealthCheckScheduled = true;
+	wispHealthTimer = window.setTimeout(() => {
+		wispHealthTimer = null;
+		runWispHealthChecks();
+	}, WISP_HEALTH_CHECK_DELAY_MS);
+}
 
-async function runWispHealthChecksOnce() {}
+async function runWispHealthChecks(options = {}) {
+	if (wispHealthCheckPromise) return wispHealthCheckPromise;
+
+	wispHealthCheckPromise = runWispHealthChecksOnce(options).finally(() => {
+		wispHealthCheckPromise = null;
+	});
+	return wispHealthCheckPromise;
+}
+
+async function runWispHealthChecksOnce({ stopOnFirst = false } = {}) {
+	const configured = getConfiguredWispUrls();
+	if (!configured.length) return;
+
+	const results = wispHealthResults.length
+		? wispHealthResults
+		: configured.map((url, index) => ({
+				url,
+				index,
+				latency: Infinity,
+				bestLatency: Infinity,
+				reachable: false,
+				successes: 0,
+				attempts: WISP_PING_ATTEMPTS,
+				pending: true,
+			}));
+	wispHealthResults = results;
+
+	// Probe only a small launch set. The latest config contains many community
+	// endpoints, and opening a WebSocket to every dead endpoint creates a wall
+	// of Firefox errors before the primary server can start.
+	const queue = configured.slice(0, 4);
+	let nextIndex = 0;
+	let stopped = false;
+
+	const probeNext = async () => {
+		if (stopped) return;
+		const url = queue[nextIndex++];
+		if (!url) return;
+		try {
+			const result = await pingWisp(url);
+			const entry = results.find((item) => item.url === url);
+			if (!entry) return;
+			Object.assign(entry, {
+				...result,
+				url,
+				latency: result.reachable ? result.latency : Infinity,
+				bestLatency: result.reachable ? result.bestLatency : Infinity,
+				pending: false,
+			});
+			if (result.reachable) {
+				if (!firstReachableWispUrl) firstReachableWispUrl = url;
+				if (stopOnFirst) stopped = true;
+				resolveFirstReachableWisp();
+				if (!stopOnFirst && ensureTransportClientReady()) {
+					probeTorCapability(url).then(() => renderTorOptions());
+				}
+			}
+			renderWispOptions(results);
+		} finally {
+			await probeNext();
+		}
+	};
+
+	await Promise.all(
+		Array.from(
+			{ length: Math.min(getWispPingConcurrency(), queue.length) },
+			probeNext
+		)
+	);
+
+	if (stopped) {
+
+		wispHealthCheckScheduled = false;
+		resolveFirstReachableWisp();
+		return;
+	}
+
+	await runTorScan();
+
+	wispHealthCheckCompleted = true;
+	resolveFirstReachableWisp();
+	renderWispOptions(results);
+}
 
 function resolveFirstReachableWisp() {
 	if (!firstReachableWispResolve) return;
@@ -2722,12 +2966,69 @@ function resolveFirstReachableWisp() {
 }
 
 function waitForFirstReachableWisp() {
-	return Promise.resolve();
+	if (!firstReachableWispPromise) {
+		firstReachableWispPromise = new Promise((resolve) => {
+			firstReachableWispResolve = resolve;
+		});
+	}
+	return firstReachableWispPromise;
 }
 
 async function selectBestWispForLaunch() {
+	const primary = getPrimaryWispUrl();
 	if (!selectedWispUrl) {
-		setSelectedWispUrl(getPrimaryWispUrl(), { warm: false });
+		setSelectedWispUrl(primary, { warm: false });
+	}
+	if (wispUserSelected) return;
+	if (getConfiguredWispUrls().length <= 1) return;
+
+	// Start with the configured primary immediately. Health probing remains a
+	// background task and the navigation retry path can switch servers if it
+	// is unavailable. This removes several seconds from the normal launch path.
+	if (!instantLaunchBoost && selectedWispUrl === primary && !wispHealthCheckCompleted) {
+		scheduleWispHealthChecks({ immediate: true });
+		return;
+	}
+
+	if (instantLaunchBoost) {
+		if (!firstReachableWispUrl) {
+			scheduleWispHealthChecks({ immediate: true, stopOnFirst: true });
+			await Promise.race([
+				waitForFirstReachableWisp(),
+				new Promise((resolve) =>
+					setTimeout(resolve, WISP_INSTANT_LAUNCH_HEALTH_BUDGET_MS)
+				),
+			]);
+		}
+
+		if (!firstReachableWispUrl) {
+			await Promise.race([
+				waitForFirstReachableWisp(),
+				new Promise((resolve) =>
+					setTimeout(resolve, WISP_LAUNCH_HEALTH_BUDGET_MS)
+				),
+			]);
+		}
+		const winner = firstReachableWispUrl || getBestReachableWispUrl();
+		if (winner && winner !== selectedWispUrl) {
+			setSelectedWispUrl(winner, { warm: false });
+		}
+		return;
+	}
+
+	if (!wispHealthCheckCompleted && !getBestReachableWispUrl()) {
+		scheduleWispHealthChecks({ immediate: true });
+		await Promise.race([
+			waitForFirstReachableWisp(),
+			new Promise((resolve) =>
+				setTimeout(resolve, WISP_LAUNCH_HEALTH_BUDGET_MS)
+			),
+		]);
+	}
+
+	const best = getBestReachableWispUrl();
+	if (best && best !== selectedWispUrl) {
+		setSelectedWispUrl(best, { warm: false });
 	}
 }
 
@@ -2767,7 +3068,8 @@ function getTorCandidateUrls() {
 }
 
 function getWispLatency(url) {
-	return 0;
+	const server = wispServers.find((item) => item.url === url);
+	return server?.reachable ? server.latency : Infinity;
 }
 
 function getDetectedTorUrls() {
@@ -3005,7 +3307,18 @@ function formatTorHealth(url) {
 	return parts.join(" · ");
 }
 
-async function ensureWispLatency(url) {}
+async function ensureWispLatency(url) {
+	const existing = wispServers.find((server) => server.url === url);
+	if (existing?.reachable) return;
+	const result = await pingWisp(url);
+	if (!result.reachable) return;
+	if (existing) {
+		Object.assign(existing, { ...result, url, pending: false });
+	} else {
+		wispServers.push({ ...result, url, index: wispServers.length });
+	}
+	renderTorOptions();
+}
 
 function renderTorOptions() {
 	torServers = getDetectedTorUrls();
@@ -4602,6 +4915,9 @@ window.addEventListener("load", async () => {
 	loadPrivacySettings();
 	syncGlobalPrivacyControls();
 
+	wispSelectTop.addEventListener("change", () =>
+		syncWispSelects(wispSelectTop)
+	);
 	torSelect?.addEventListener("change", () =>
 		setSelectedTorUrl(torSelect.value)
 	);
@@ -4692,12 +5008,14 @@ window.addEventListener("load", async () => {
 		[restoreSearchEngine, "search engine restore"],
 		[renderTransportOptions, "transport options"],
 		[initAutocomplete, "autocomplete"],
+		[initWispPicker, "the Wisp picker"],
 		[initTorPicker, "the Tor picker"],
 		[initCustomSelectPickers, "select pickers"],
 		[wireBookmarks, "bookmark wiring"],
 		[wireScripts, "script wiring"],
 		[renderBookmarks, "bookmark list"],
 		[renderScriptsList, "script list"],
+		[initializeWispDropdowns, "wisp dropdowns"],
 		[initializeTorDropdown, "tor dropdown"],
 	];
 	for (const [step, label] of stabilizedInit) {
@@ -4707,6 +5025,8 @@ window.addEventListener("load", async () => {
 			console.warn("Pulsar could not run", label, err);
 		}
 	}
+
+	scheduleWispHealthChecks({ immediate: true });
 
 	restoreSessionTabs();
 	postPrivacyConfigToServiceWorker();

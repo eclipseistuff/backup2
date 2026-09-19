@@ -1,7 +1,8 @@
 window.__PULSAR_CONFIG__ = {
     wispUrl: "wss://probuildingsupplies.com/w/",
     wispUrls: [
-        "wss://probuildingsupplies.com/w/"
+        "wss://probuildingsupplies.com/w/",
+        "wss://stalbansepiscopal.com/wisp/"
     ],
 
     torUrls: [],
